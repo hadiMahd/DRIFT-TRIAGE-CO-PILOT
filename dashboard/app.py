@@ -87,7 +87,23 @@ for col, name, url in [
 
 st.divider()
 
-# ── Main Area: Drift Monitoring (left) + HIL Inbox (right) ───────────────────
+# ── Registry Status ───────────────────────────────────────────────────────────
+
+reg = _get(f"{PLATFORM}/registry/status")
+r1, r2, r3, r4 = st.columns(4)
+if reg:
+    with r1:
+        st.metric("Model", reg.get("registered_model_name", "—"))
+    with r2:
+        st.metric("Production", reg.get("production_version") or "—")
+    with r3:
+        st.metric("Candidate", reg.get("candidate_version") or "—")
+    with r4:
+        st.metric("Status", reg.get("status", "—"))
+
+st.divider()
+
+# ── Main Area: Drift Monitoring (left) + Human Decision (right) ─────────────
 
 left, right = st.columns([1.3, 1], gap="large")
 
@@ -144,7 +160,7 @@ with left:
         st.caption("Tip: 400 normal + 100 shifted predictions triggers PSI on euribor3m")
 
 with right:
-    st.subheader("HIL Approval Inbox")
+    st.subheader("Human Decision")
 
     if st.session_state.approval_msg:
         msg, kind = st.session_state.approval_msg
@@ -164,9 +180,18 @@ with right:
             with st.container(border=True):
                 st.markdown(f"**Action:** `{a.get('requested_action','?')}`")
                 st.caption(f"Target: `{a.get('target_model_version','?')}` | Status: `{a.get('status','?')}`")
-                st.caption(f"ID: `{a['approval_id'][:8]}...`")
+                st.caption(f"Created: `{str(a.get('created_at','?'))[:19].replace('T',' ')}` | Investigation: `{a.get('investigation_id','?')[:8]}...`")
 
-                # Show candidate metrics if available
+                # Show drifted features from last drift result
+                drift = st.session_state.drift_result or {}
+                report = drift.get("report", {})
+                if report.get("psi_scores"):
+                    drifted = [f for f, v in report["psi_scores"].items() if v > 0.01]
+                    if drifted:
+                        st.caption(f"📊 Drifted features: {', '.join(drifted)}")
+                st.caption("Agent detected critical drift → recommended retrain → candidate model ready for review.")
+
+                # Candidate vs Production comparison
                 reg = _get(f"{PLATFORM}/registry/status")
                 if reg.get("candidate_version"):
                     c1m, c2m, c3m = st.columns(3)
@@ -199,23 +224,6 @@ with right:
                         st.rerun()
 
 st.divider()
-
-# ── Registry Status ───────────────────────────────────────────────────────────
-
-st.subheader("Registry Status")
-reg = _get(f"{PLATFORM}/registry/status")
-if reg:
-    r1, r2, r3, r4 = st.columns(4)
-    with r1:
-        st.metric("Model", reg.get("registered_model_name", "—"))
-    with r2:
-        st.metric("Production", reg.get("production_version") or "—")
-    with r3:
-        st.metric("Candidate", reg.get("candidate_version") or "—")
-    with r4:
-        st.metric("Status", reg.get("status", "—"))
-else:
-    st.caption("Registry unavailable")
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 
