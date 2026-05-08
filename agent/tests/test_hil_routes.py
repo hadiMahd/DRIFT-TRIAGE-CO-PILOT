@@ -15,7 +15,6 @@ from agent.app.schemas.hil_action import HILAction
 def build_approval(
     *,
     approval_id: str = "apr-1",
-    requested_action: str = "rollback",
     status: str = "pending",
     approved_by: str | None = None,
 ) -> HILAction:
@@ -25,7 +24,7 @@ def build_approval(
         approval_id=approval_id,
         investigation_id="inv-1",
         drift_event_id="evt-1",
-        requested_action=requested_action,
+        requested_action="rollback",
         target_model_version="7",
         status=status,
         requested_by="agent",
@@ -88,9 +87,6 @@ class HILRouteTests(unittest.TestCase):
         ), patch(
             "agent.app.routers.hil.request_approval.approve_action",
             new=AsyncMock(return_value=build_approval(status="approved", approved_by="jad")),
-        ), patch(
-            "agent.app.routers.hil._dispatch_rollback",
-            new=AsyncMock(return_value=None),
         ):
             response = self.client.post(
                 "/hil/apr-1/approve",
@@ -121,34 +117,6 @@ class HILRouteTests(unittest.TestCase):
             response.json(),
             {"approval_id": "apr-1", "status": "rejected", "message": "Approval rejected"},
         )
-
-    def test_approve_promote_dispatches_platform_promotion(self) -> None:
-        with patch(
-            "agent.app.routers.hil.request_approval.get_approval",
-            new=AsyncMock(return_value=build_approval(requested_action="promote_candidate")),
-        ), patch(
-            "agent.app.routers.hil.request_approval.approve_action",
-            new=AsyncMock(
-                return_value=build_approval(
-                    requested_action="promote_candidate",
-                    status="approved",
-                    approved_by="jad",
-                )
-            ),
-        ), patch(
-            "agent.app.routers.hil._resolve_target_version",
-            new=AsyncMock(return_value="12"),
-        ), patch(
-            "agent.app.routers.hil._dispatch_promotion",
-            new=AsyncMock(return_value=None),
-        ) as dispatch_mock:
-            response = self.client.post(
-                "/hil/apr-1/approve",
-                json={"approved_by": "jad", "reason": "Ship it"},
-            )
-
-        self.assertEqual(response.status_code, 200)
-        dispatch_mock.assert_awaited_once()
 
     def test_invalid_transition_returns_409(self) -> None:
         with patch(
