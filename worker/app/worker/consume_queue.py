@@ -117,6 +117,29 @@ AGENT_BASE_URL = os.getenv("AGENT_BASE_URL", "http://agent:8001")
 PLATFORM_BASE_URL = os.getenv("PLATFORM_BASE_URL", "http://platform:8000")
 
 
+def _resolve_candidate_version(model_uri: str) -> str | None:
+    if not model_uri:
+        return None
+
+    if model_uri.startswith("models:/") and "/" in model_uri.removeprefix("models:/"):
+        return model_uri.rsplit("/", 1)[-1]
+
+    if "@" in model_uri:
+        try:
+            import mlflow
+
+            mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
+            client = mlflow.MlflowClient()
+            registry_name = model_uri.removeprefix("models:/").split("@", 1)[0]
+            alias = model_uri.split("@", 1)[1]
+            version = client.get_model_version_by_alias(registry_name, alias).version
+            return str(version)
+        except Exception:
+            return None
+
+    return None
+
+
 async def _notify_agent_candidate(
     investigation_id: str,
     drift_event_id: str,
@@ -127,28 +150,41 @@ async def _notify_agent_candidate(
     if httpx is None:
         logger.warning("httpx not available, cannot notify agent")
         return False
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{AGENT_BASE_URL}/hil/notify-candidate",
-                json={
-                    "investigation_id": investigation_id,
-                    "drift_event_id": drift_event_id,
-                    "model_uri": model_uri,
-                    "target_model_version": model_uri.split("/")[-1]
-                    if model_uri
-                    else None,
-                    "metrics": metrics or {},
-                },
-            )
+
+    target_model_version = _resolve_candidate_version(model_uri)
+    payload = {
+        "investigation_id": investigation_id,
+        "drift_event_id": drift_event_id,
+        "model_uri": model_uri,
+        "target_model_version": target_model_version,
+        "metrics": metrics or {},
+    }
+    timeout = httpx.Timeout(30.0, connect=5.0)
+
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{AGENT_BASE_URL}/hil/notify-candidate",
+                    json=payload,
+                )
             if resp.status_code == 201:
-                logger.info("agent_notified_hil", model_uri=model_uri)
+                logger.info("agent_notified_hil", model_uri=model_uri, attempt=attempt)
                 return True
-            logger.warning("agent_hil_rejected", status=resp.status_code)
-            return False
-    except Exception as exc:
-        logger.warning("agent_hil_unreachable", error=str(exc))
-        return False
+
+            logger.warning(
+                "agent_hil_rejected",
+                status=resp.status_code,
+                attempt=attempt,
+                detail=(resp.text or "")[:200],
+            )
+        except Exception as exc:
+            logger.warning("agent_hil_unreachable", attempt=attempt, error=repr(exc))
+
+        if attempt < 3:
+            await asyncio.sleep(attempt * 2)
+
+    return False
 
 
 async def handle_retrain(job: dict[str, Any]) -> None:

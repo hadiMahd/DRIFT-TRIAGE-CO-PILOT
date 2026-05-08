@@ -1,58 +1,122 @@
 # Runbook
 
 ## Prerequisites
+
 - Docker Desktop running
-- `uv` installed for optional local test and bootstrap commands
+- optional local Python environment for tests
+- `.env` copied from `.env.example`
 
-Windows install for `uv`:
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+## Startup
 
-## Compose Startup
-1. Copy the environment template:
 ```powershell
 Copy-Item .env.example .env
+docker compose up -d --build
+docker compose ps
 ```
-2. Keep `LLM_PROVIDER=mock` for the no-key demo.
-3. Only fill Azure or LangSmith keys if you explicitly want LLM-backed runs.
-4. If `platform/data/model.joblib` is missing, bootstrap it before startup:
+
+Recommended default:
+
+- keep `LLM_PROVIDER=mock` for the no-key demo path
+
+If `platform/data/model.joblib` is missing, bootstrap it first:
+
 ```powershell
 Copy-Item initial-training/dataset/bank-additional-full.csv platform/data/
 cd platform
 uv run python -m app.services.run_training
 cd ..
 ```
-5. Start the stack:
-```powershell
-docker compose up --build
-```
 
 ## URLs
+
 - Dashboard: `http://localhost:8501`
 - Platform health: `http://localhost:8000/health`
 - Agent health: `http://localhost:8001/health`
 - MLflow: `http://localhost:5000`
+- pgAdmin: `http://localhost:5050`
 - Postgres host port: `55432`
 
-## Demo Flow
+## Demo Steps
+
 1. Open the dashboard.
-2. Confirm Platform Status and Agent Status are healthy.
-3. Click `Run Drift Report`.
-4. Confirm the platform webhook reaches the agent.
-5. Trigger a demo moderate or critical drift event if you want a queued worker action.
-6. Check the Redis queue if needed:
+2. Confirm Platform, Agent, MLflow, and Queue/Worker are connected.
+3. Click one of the drift buttons:
+   - `Normal (500)`
+   - `Moderate Drift`
+   - `Critical Drift`
+4. Read the drift result panel.
+5. For critical drift:
+   - retraining is queued first
+   - wait about 5-10 seconds
+   - click `Refresh` in the HIL inbox
+6. Approve or reject the pending HIL approval.
+7. Review registry status and promotion history.
+8. Use pgAdmin or `psql` if you need to prove audit rows.
+
+## Live Checks
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod http://127.0.0.1:8001/health
+Invoke-RestMethod http://127.0.0.1:8000/registry/status
+Invoke-RestMethod http://127.0.0.1:8000/registry/history
+Invoke-RestMethod http://127.0.0.1:8000/queue/status
+Invoke-RestMethod http://127.0.0.1:8001/hil/pending
+```
+
+## Queue And Worker
+
+- Queue: `drift-triage-jobs`
+- DLQ: `DLQ:drift-triage-jobs`
+
+Useful commands:
+
 ```powershell
 docker compose exec redis redis-cli LLEN drift-triage-jobs
+docker compose exec redis redis-cli LLEN DLQ:drift-triage-jobs
+docker compose logs --tail=120 worker
 ```
-7. Watch worker logs if needed:
-```powershell
-docker compose logs -f worker
-```
-8. Approve or reject pending HIL approvals from the dashboard inbox.
 
-## Notes
-- The worker consumes jobs from `drift-triage-jobs`.
-- `replay_test` is a stubbed safe handler.
-- `retrain` runs the platform training pipeline and registers a candidate in MLflow.
-- `rollback` remains a stubbed worker handler and still requires HIL approval before any future production action.
+Current behavior:
+
+- `replay_test` is implemented as a safe queued validation path
+- `retrain` runs the platform training pipeline and registers a candidate in MLflow
+- worker rollback dispatch is implemented and requires `approval_id`
+- candidate notification to the agent is retried to avoid losing the HIL approval step
+
+## Audit Checks
+
+```powershell
+docker compose exec postgres psql -U user -d drift -c "SELECT * FROM hil_approvals ORDER BY created_at DESC LIMIT 10;"
+docker compose exec postgres psql -U user -d drift -c "SELECT * FROM promotion_audit ORDER BY timestamp DESC LIMIT 10;"
+docker compose exec postgres psql -U user -d drift -c "SELECT * FROM investigations ORDER BY updated_at DESC LIMIT 10;"
+docker compose exec postgres psql -U user -d drift -c "SELECT * FROM investigation_checkpoints ORDER BY updated_at DESC LIMIT 10;"
+```
+
+## Troubleshooting
+
+### Critical drift finished but no approval appeared yet
+
+- wait a few seconds for worker retraining to finish
+- click `Refresh` in the HIL inbox
+- check `docker compose logs --tail=120 worker`
+- check `Invoke-RestMethod http://127.0.0.1:8001/hil/pending`
+
+### Dashboard says request timeout
+
+- confirm platform and agent health endpoints return `200`
+- refresh the dashboard once with `Ctrl+F5`
+- inspect:
+
+```powershell
+docker compose logs --tail=80 dashboard
+docker compose logs --tail=80 platform
+docker compose logs --tail=80 agent
+```
+
+### Approval exists but Production did not change
+
+- inspect the approval row in Postgres
+- confirm the row is `approved`
+- inspect platform logs for promotion or rollback validation errors
+- inspect `promotion_audit` to confirm whether the audit write succeeded

@@ -143,7 +143,7 @@ But:
 
 **Extensibility.** Adding a new node (e.g., "notify Slack") means adding one function and one routing condition. In an if-else chain, you'd need to restructure the flow.
 
-**Checkpointing.** LangGraph can pause the graph and resume later (e.g., after HIL approval). This is partially implemented with Postgres checkpoints.
+**Checkpointing.** The repo now persists investigations and checkpoint state in Postgres and reuses the same investigation by `drift_event_id`. The optional LangGraph Postgres saver helper still exists, but the proven live recovery path is the repo-owned Postgres persistence flow.
 
 **Observability.** LangSmith integration traces every node execution, making the decision path visible.
 
@@ -421,7 +421,7 @@ request.app.state.threshold = run_metrics["operating_threshold"]
 
 **Why reload instead of restarting?** Restarting the container takes seconds and causes a brief outage. Hot-reloading takes milliseconds with zero downtime. The platform continues serving predictions from the old model until the reload completes.
 
-**Why `mlflow.sklearn.load_model()` instead of `joblib.load(model.joblib)`?** After a rollback, the local `model.joblib` file still contains the retrained model (v26), not the rolled-back version (v1). MLflow's artifact store has every version's model. Loading from MLflow ensures we always load the correct version.
+**Why `mlflow.sklearn.load_model()` instead of `joblib.load(model.joblib)`?** After a rollback, the local `model.joblib` file can still contain a newer retrained model rather than the rolled-back Production version. MLflow's artifact store has every registered version. Loading from MLflow ensures we always load the version pointed to by the current alias.
 
 **`_previous_production_version(settings)`**
 
@@ -487,7 +487,7 @@ Returns the full registry state:
 - Non-existent (404)
 - Still pending (409 — someone tried to rollback before approval)
 - For a different action like promote_candidate (409)
-- For a different target version (409 — can't rollback to v3 with an approval for v1)
+- For a different target version (409 — cannot roll back to one version with an approval issued for another)
 
 Every case is an explicit error, not a silent failure.
 
@@ -506,7 +506,7 @@ if row["requested_action"] != "rollback": raise 409
 if row["target_model_version"] != body.target_version: raise 409
 ```
 
-**Why validate `target_model_version` match?** An approval for "rollback to v1" should not allow rolling back to v19. This prevents an attacker with a valid approval ID from rolling back to an arbitrary version.
+**Why validate `target_model_version` match?** An approval for one rollback target should not allow rolling back to some other arbitrary version. This prevents a valid approval ID from being reused for the wrong Production mutation.
 
 **`GET /history`**
 
@@ -714,7 +714,7 @@ result = await graph.ainvoke(initial, config=config)
 return result
 ```
 
-**Why `thread_id` = `investigation_id`?** LangGraph uses `thread_id` for checkpointing — if the graph is paused (e.g., waiting for HIL approval), it can resume from the checkpoint. The investigation_id is a natural thread identifier.
+**Why reuse `investigation_id` per `drift_event_id`?** The repo reuses the same persisted investigation state when the same drift event is delivered again. That keeps retries idempotent and lets the graph continue from saved Postgres state instead of creating a second investigation for the same event.
 
 ### File: `agent/app/graph/run_triage.py`
 
@@ -1319,22 +1319,19 @@ Each prediction call: `platform/app/routers/predict.py:predict()`
 
 **Step 8: Dashboard shows approval**
 
-`dashboard/app.py` polls `GET /hil/pending` → shows approval card with:
-- Action: promote_candidate
-- Target: v26
-- Metrics: Recall 0.781, F1 0.355, AUC 0.817
-- Recall >= 0.75: ✅ PASS
+`dashboard/app.py` reads `GET /hil/pending` and shows the newest pending approval card with:
+- Action: `promote_candidate`
+- Target: the concrete candidate version resolved by the worker
+- Approver input and approve/reject actions
+- Registry and queue context beside the inbox
 
 **Step 9: Human approves, promotes**
 
 - User clicks "Approve" in HIL Inbox
-- Dashboard: `POST /hil/{id}/approve` → status = "approved"
-- Cache cleared, page reruns
-- User navigates to Registry Status
-- Promotion history shows: candidate → Production, previous version = v1
-- User enters approval ID, clicks "Rollback to v1" → `POST /registry/rollback`
-- Platform validates approval, writes audit, changes alias, reloads model
-- Dashboard shows: Production v1, previous_production_version = v26
+- Dashboard: `POST /hil/{id}/approve` -> status = `approved`
+- Agent dispatches `POST /registry/promote`
+- Platform validates the approved `promote_candidate` row, writes the audit row, changes the MLflow alias, and reloads the model
+- Registry Status now shows the updated Production version and metrics
 
 ### Workflow 2: Stable Drift (no action)
 
@@ -1350,7 +1347,7 @@ Each prediction call: `platform/app/routers/predict.py:predict()`
 
 ### Workflow 3: Rollback
 
-**Precondition:** Production is v26, previous_production_version = v1 (from promotion audit)
+**Precondition:** a Production version exists and `previous_production_version` is available from promotion audit history
 
 **Step 1: User creates a rollback HIL approval**
 - Could be via agent dispatch or manual creation
@@ -1361,22 +1358,21 @@ Each prediction call: `platform/app/routers/predict.py:predict()`
 **Step 3: User initiates rollback from dashboard**
 - Opens Promotion History expander
 - Enters rollback approval ID
-- Clicks "Rollback to v1"
-- Dashboard: `POST /registry/rollback {target_version: "1", approval_id: "...", approved_by: "admin"}`
+- Clicks the rollback button for the previously audited version
+- Dashboard: `POST /registry/rollback {target_version: "<previous>", approval_id: "...", approved_by: "admin"}`
 
 **Step 4: Platform validates and executes**
 - `_validate_rollback_approval()`: checks approval exists, is approved, is for rollback, version matches
-- `_capture_current_production()`: captures v26 as previous_version
-- `_write_rollback_audit()`: INSERT promotion_audit (model_uri=v1, previous_version=v26, from=Production, to=Production)
-- `mlflow_client.set_registered_model_alias("Production", "1")`
-- `_reload_model()`: loads model from `models:/bank_marketing_pipeline@Production` (now v1)
+- `_capture_current_production()`: captures the current Production version as `previous_version`
+- `_write_rollback_audit()`: INSERT into `promotion_audit` before alias mutation
+- `mlflow_client.set_registered_model_alias("Production", "<target_version>")`
+- `_reload_model()`: loads the new Production alias from MLflow
 - Returns updated status
 
 **Step 5: Dashboard refreshes**
-- Production: v1
-- previous_production_version: v26
-- Promotion history shows new entry: Production → Production, previous_version = v26
-- Rollback button now shows "Rollback to v26"
+- `production_version` now reflects the rollback target
+- `previous_production_version` now reflects the version that was active before the rollback
+- promotion history contains the new rollback audit row
 
 ---
 
@@ -1473,7 +1469,8 @@ The audit trail in Postgres is append-only — rows are never updated or deleted
 | `app/schemas/hil_action.py` | 50 | Approval request/decision/response models |
 | `app/schemas/investigation.py` | 40 | Status machine, action literals |
 | `app/services/request_approval.py` | 245 | Postgres CRUD for HIL approvals, idempotency, status transitions |
-| `app/services/manage_checkpoints.py` | 46 | LangGraph Postgres checkpoint setup |
+| `app/services/manage_checkpoints.py` | 46 | Optional LangGraph Postgres saver helper |
+| `app/services/investigations.py` | live repo file | Investigation and checkpoint persistence in Postgres |
 | `app/tools/queue_client.py` | 112 | Redis enqueue with idempotency |
 | `app/tools/dispatch_replay.py` | 34 | Builds replay job payload |
 | `app/tools/dispatch_retrain.py` | 27 | Builds retrain job payload |

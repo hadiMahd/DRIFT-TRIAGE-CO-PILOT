@@ -86,5 +86,15 @@ async def predict(
             "poutcome": body.poutcome,
             "proba": proba,
         })
+        window_size = getattr(state.settings, "drift_window_size", len(state.drift_accumulator))
+        if len(state.drift_accumulator) > window_size:
+            state.drift_accumulator = state.drift_accumulator[-window_size:]
+
+        store = getattr(state, "drift_state_store", None)
+        if store is not None:
+            try:
+                await store.save_state(state.drift_accumulator, state.last_severity)
+            except Exception:
+                pass
 
     return PredictResponse(prediction=prediction, probability=proba)

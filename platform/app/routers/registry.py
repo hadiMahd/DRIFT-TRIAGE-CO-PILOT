@@ -17,9 +17,28 @@ from pydantic import BaseModel, ConfigDict
 
 from app.dependencies import get_http_client, get_settings
 from app.schemas.promote_request import PromoteRequest
-from app.services.validate_promotion import assert_promotion_checklist
+from app.services.validate_promotion import assert_promotion_checklist, parse_model_reference
 
 router = APIRouter()
+PROMOTION_AUDIT_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS promotion_audit (
+    id SERIAL PRIMARY KEY,
+    model_uri TEXT NOT NULL,
+    investigation_id TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    from_alias TEXT NULL,
+    to_alias TEXT NOT NULL DEFAULT 'Production',
+    previous_version TEXT NULL
+);
+"""
+PROMOTION_AUDIT_MIGRATION_SQL = (
+    "ALTER TABLE promotion_audit ADD COLUMN IF NOT EXISTS from_alias TEXT NULL",
+    "ALTER TABLE promotion_audit ADD COLUMN IF NOT EXISTS to_alias TEXT NOT NULL DEFAULT 'Production'",
+    "ALTER TABLE promotion_audit ADD COLUMN IF NOT EXISTS previous_version TEXT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_promotion_audit_model_uri ON promotion_audit (model_uri)",
+    "CREATE INDEX IF NOT EXISTS idx_promotion_audit_timestamp ON promotion_audit (timestamp DESC)",
+)
 
 
 class RollbackRequest(BaseModel):
@@ -31,6 +50,18 @@ class RollbackRequest(BaseModel):
 
 def _pg_dsn(settings) -> str:
     return settings.postgres_dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+async def ensure_registry_schema(settings) -> None:
+    import asyncpg
+
+    conn = await asyncpg.connect(_pg_dsn(settings), timeout=5)
+    try:
+        await conn.execute(PROMOTION_AUDIT_SCHEMA_SQL)
+        for statement in PROMOTION_AUDIT_MIGRATION_SQL:
+            await conn.execute(statement)
+    finally:
+        await conn.close()
 
 
 async def _fetch_production_metrics(settings) -> dict:
@@ -74,6 +105,27 @@ async def _previous_production_version(settings) -> str | None:
     return None
 
 
+async def _latest_promotion_snapshot(settings) -> tuple[str | None, str | None]:
+    try:
+        import asyncpg
+
+        conn = await asyncpg.connect(_pg_dsn(settings), timeout=5)
+        try:
+            row = await conn.fetchrow(
+                """SELECT previous_version, timestamp
+                   FROM promotion_audit
+                   ORDER BY timestamp DESC LIMIT 1"""
+            )
+            if row:
+                timestamp = row["timestamp"].isoformat() if row["timestamp"] else None
+                return row["previous_version"], timestamp
+        finally:
+            await conn.close()
+    except Exception:
+        pass
+    return None, None
+
+
 def _capture_current_production(settings) -> str | None:
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     client = MlflowClient()
@@ -114,6 +166,7 @@ async def registry_status(settings=Depends(get_settings)) -> dict:
 
     prod_ver: str | None = None
     cand_ver: str | None = None
+    cand_updated_at: int | None = None
     last_promotion: str | None = None
 
     try:
@@ -129,15 +182,18 @@ async def registry_status(settings=Depends(get_settings)) -> dict:
             settings.registered_model_name, "candidate",
         )
         cand_ver = str(cand.version)
-        if cand.last_updated_timestamp:
-            last_promotion = datetime.fromtimestamp(
-                cand.last_updated_timestamp / 1000, tz=timezone.utc,
-            ).isoformat()
+        cand_updated_at = cand.last_updated_timestamp
     except Exception:
         pass
 
     production_metrics = await _fetch_production_metrics(settings) if prod_ver else {}
-    previous_version = await _previous_production_version(settings)
+    previous_version, audit_timestamp = await _latest_promotion_snapshot(settings)
+    if audit_timestamp:
+        last_promotion = audit_timestamp
+    elif cand_ver and cand_updated_at:
+        last_promotion = datetime.fromtimestamp(
+            cand_updated_at / 1000, tz=timezone.utc,
+        ).isoformat()
 
     return {
         "registered_model_name": settings.registered_model_name,
@@ -162,6 +218,11 @@ async def promote(
             status_code=422,
             detail="approved_by is required — promotion must be authorized.",
         )
+    if not body.approval_id:
+        raise HTTPException(
+            status_code=422,
+            detail="approval_id is required for promotion.",
+        )
 
     try:
         assert_promotion_checklist(body.model_uri)
@@ -171,6 +232,8 @@ async def promote(
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     mlflow_client = MlflowClient()
 
+    requested_version = _requested_model_version(settings, body.model_uri)
+    await _validate_promote_approval(settings, body, requested_version)
     previous_version = _capture_current_production(settings)
 
     try:
@@ -179,7 +242,7 @@ async def promote(
         mlflow_client.set_registered_model_alias(
             name=settings.registered_model_name,
             alias="Production",
-            version=body.model_uri.split("/")[-1],
+            version=requested_version,
         )
 
         if request:
@@ -322,6 +385,87 @@ async def _write_rollback_audit(settings, body: RollbackRequest, approval: dict,
         )
     finally:
         await conn.close()
+
+
+def _requested_model_version(settings, model_uri: str) -> str:
+    model_name, requested_version, requested_alias = parse_model_reference(model_uri)
+    if model_name != settings.registered_model_name:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Requested model '{model_name}' does not match registered model "
+                f"'{settings.registered_model_name}'."
+            ),
+        )
+    if requested_version:
+        return requested_version
+    if requested_alias:
+        mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+        client = MlflowClient()
+        try:
+            mv = client.get_model_version_by_alias(settings.registered_model_name, requested_alias)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Model alias '{requested_alias}' was not found.",
+            ) from exc
+        return str(mv.version)
+    raise HTTPException(status_code=422, detail="model_uri must reference a model version.")
+
+
+async def _validate_promote_approval(settings, body: PromoteRequest, requested_version: str) -> dict:
+    try:
+        import asyncpg
+
+        conn = await asyncpg.connect(_pg_dsn(settings), timeout=5)
+        try:
+            row = await conn.fetchrow(
+                """SELECT approval_id, investigation_id, requested_action,
+                          target_model_version, status, approved_by
+                   FROM hil_approvals
+                   WHERE approval_id = $1""",
+                body.approval_id,
+            )
+        finally:
+            await conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Promotion approval check failed: {exc}",
+        ) from exc
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Promotion approval not found.")
+    if row["status"] != "approved":
+        raise HTTPException(status_code=409, detail="Promotion approval is not approved.")
+    if row["requested_action"] != "promote_candidate":
+        raise HTTPException(status_code=409, detail="Approval is not for candidate promotion.")
+    if row["investigation_id"] != body.investigation_id:
+        raise HTTPException(status_code=409, detail="Approval investigation does not match promote request.")
+
+    approval_target = (row["target_model_version"] or "").strip()
+    if approval_target and approval_target != requested_version:
+        candidate_version = _current_candidate_version(settings)
+        if approval_target.lower() not in {
+            "candidate",
+            f"{settings.registered_model_name}@candidate".lower(),
+        } or candidate_version != requested_version:
+            raise HTTPException(
+                status_code=409,
+                detail="Approval target version does not match promote target.",
+            )
+
+    return dict(row)
+
+
+def _current_candidate_version(settings) -> str | None:
+    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+    client = MlflowClient()
+    try:
+        mv = client.get_model_version_by_alias(settings.registered_model_name, "candidate")
+        return str(mv.version)
+    except Exception:
+        return None
 
 
 async def _validate_rollback_approval(settings, body: RollbackRequest) -> dict:

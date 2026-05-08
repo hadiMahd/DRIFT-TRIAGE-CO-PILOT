@@ -18,34 +18,66 @@ from mlflow.tracking import MlflowClient
 from app.config.settings import Settings
 
 
+def parse_model_reference(model_uri: str) -> tuple[str, str | None, str | None]:
+    clean = model_uri.removeprefix("models:/").strip()
+    if "/" in clean:
+        name, version = clean.rsplit("/", 1)
+        return name, version, None
+    if "@" in clean:
+        name, alias = clean.split("@", 1)
+        return name, None, alias
+    return clean, None, None
+
+
 def assert_promotion_checklist(model_uri: str) -> None:
     settings = Settings()
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     client = MlflowClient()
+    model_name, requested_version, requested_alias = parse_model_reference(model_uri)
 
-    # 1 — model_uri exists
+    if model_name != settings.registered_model_name:
+        raise ValueError(
+            f"Requested model '{model_name}' does not match registered model "
+            f"'{settings.registered_model_name}'."
+        )
+
     try:
-        mv = client.get_model_version_by_alias(
-            name="bank_marketing_pipeline",
+        candidate = client.get_model_version_by_alias(
+            name=settings.registered_model_name,
             alias="candidate",
         )
     except MlflowException:
         raise ValueError(
-            f"No model found at 'bank_marketing_pipeline@candidate'. "
+            f"No model found at '{settings.registered_model_name}@candidate'. "
             "Retrain first to produce a candidate."
         )
 
-    try:
-        mv = client.get_model_version_by_alias(
-            name="bank_marketing_pipeline",
-            alias="candidate",
-        )
-    except MlflowException:
+    if requested_version is not None:
+        version = requested_version
+        try:
+            mv = client.get_model_version(name=settings.registered_model_name, version=version)
+        except MlflowException as exc:
+            raise ValueError(f"Requested model version {version} was not found.") from exc
+    elif requested_alias is not None:
+        try:
+            mv = client.get_model_version_by_alias(
+                name=settings.registered_model_name,
+                alias=requested_alias,
+            )
+        except MlflowException as exc:
+            raise ValueError(
+                f"No model found at '{settings.registered_model_name}@{requested_alias}'."
+            ) from exc
+        version = str(mv.version)
+    else:
+        raise ValueError("model_uri must reference an exact version or a registered alias.")
+
+    if str(candidate.version) != str(version):
         raise ValueError(
-            f"No candidate model found. Retrain first to produce a candidate."
+            f"Requested version {version} is not the current candidate alias "
+            f"(candidate={candidate.version})."
         )
 
-    version = mv.version
     run_id = mv.run_id
     if not run_id:
         raise ValueError(f"Model version {version} has no associated run. Cannot validate artifacts.")

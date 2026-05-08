@@ -39,6 +39,18 @@ CREATE INDEX IF NOT EXISTS idx_investigations_status
 CREATE INDEX IF NOT EXISTS idx_investigations_drift_event_id
     ON investigations (drift_event_id);
 
+CREATE TABLE IF NOT EXISTS investigation_checkpoints (
+    investigation_id TEXT PRIMARY KEY,
+    drift_event_id TEXT NOT NULL,
+    last_completed_node TEXT NULL,
+    state_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_investigation_checkpoints_drift_event_id
+    ON investigation_checkpoints (drift_event_id);
+
 CREATE TABLE IF NOT EXISTS promotion_audit (
     id SERIAL PRIMARY KEY,
     model_uri TEXT NOT NULL,
@@ -55,3 +67,15 @@ CREATE INDEX IF NOT EXISTS idx_promotion_audit_model_uri
 
 CREATE INDEX IF NOT EXISTS idx_promotion_audit_timestamp
     ON promotion_audit (timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS platform_drift_state (
+    state_id BOOLEAN PRIMARY KEY DEFAULT TRUE,
+    drift_accumulator JSONB NOT NULL DEFAULT '[]'::jsonb,
+    last_severity TEXT NOT NULL DEFAULT 'stable',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (state_id = TRUE)
+);
+
+INSERT INTO platform_drift_state (state_id, drift_accumulator, last_severity)
+VALUES (TRUE, '[]'::jsonb, 'stable')
+ON CONFLICT (state_id) DO NOTHING;

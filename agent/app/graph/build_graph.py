@@ -8,6 +8,7 @@ based on the current AgentState.
 from __future__ import annotations
 
 import os
+from inspect import isawaitable
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
@@ -20,6 +21,7 @@ from agent.app.graph.run_supervisor import supervisor_node
 from agent.app.graph.run_triage import run_triage
 from agent.app.graph.state import AgentState
 from agent.app.schemas.drift_alert import DriftAlert
+from agent.app.services import investigations
 from agent.app.services.manage_checkpoints import create_checkpointer
 
 
@@ -121,8 +123,48 @@ def build_agent_graph():
 
 
 async def run_investigation(drift_alert: DriftAlert) -> AgentState:
-    """Invoke the compiled LangGraph flow."""
+    """Run the supervisor topology with durable checkpoints when Postgres is available."""
 
-    graph = build_agent_graph()
-    result = await graph.ainvoke(_initial_state(drift_alert))
-    return result
+    try:
+        await investigations.ensure_tables()
+    except Exception:
+        pass
+
+    state = await _load_or_initialize_state(drift_alert)
+    node_runners = {
+        "triage": run_triage,
+        "action": run_action,
+        "execute_action": run_execute_action,
+        "comms": run_comms,
+    }
+
+    while True:
+        next_node = supervisor_node(state).get("next_node", END)
+        if next_node == END:
+            break
+
+        result = node_runners[next_node](state)
+        state = await result if isawaitable(result) else result
+
+        try:
+            await investigations.save_state(state, last_completed_node=next_node)
+        except Exception:
+            pass
+
+    return state
+
+
+async def _load_or_initialize_state(drift_alert: DriftAlert) -> AgentState:
+    try:
+        saved_state = await investigations.load_state_by_drift_event(drift_alert.event_id)
+        if saved_state is not None:
+            return saved_state
+    except Exception:
+        pass
+
+    state = _initial_state(drift_alert)
+    try:
+        await investigations.save_state(state, last_completed_node=None)
+    except Exception:
+        pass
+    return state

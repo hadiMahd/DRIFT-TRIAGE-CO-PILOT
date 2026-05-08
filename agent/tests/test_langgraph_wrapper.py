@@ -158,6 +158,32 @@ class LangGraphWrapperTests(IsolatedAsyncioTestCase):
         self.assertEqual(state["recommended_action"], "none")
         self.assertIn("Received stable drift alert", state["comms_summary"])
 
+    async def test_run_investigation_returns_saved_checkpoint_state(self) -> None:
+        saved_state = {
+            "investigation_id": "inv-existing",
+            "drift_event_id": "drift-stable-001",
+            "drift_alert": sample_alert(severity="stable"),
+            "severity": "stable",
+            "triage_summary": "Already triaged.",
+            "recommended_action": "none",
+            "comms_summary": "Already resolved.",
+            "job_id": None,
+            "queued": False,
+            "queue_name": None,
+            "dispatch_error": None,
+            "approval_id": None,
+            "requires_approval": False,
+            "status": "resolved",
+        }
+        with patch(
+            "agent.app.graph.build_graph.investigations.load_state_by_drift_event",
+            new=AsyncMock(return_value=saved_state),
+        ):
+            state = await run_investigation(sample_alert(severity="stable"))
+
+        self.assertEqual(state["investigation_id"], "inv-existing")
+        self.assertEqual(state["comms_summary"], "Already resolved.")
+
 
 if __name__ == "__main__":
     import unittest

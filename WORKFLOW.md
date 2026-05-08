@@ -1,24 +1,23 @@
 # Drift Triage Co-Pilot Workflow
 
-This file explains how the full Week 5 app works during the demo. It separates the real monitoring path from the synthetic demo path because they are intentionally different.
+This file describes the current live workflow in the repo.
 
 ## Services
 
 | Service | URL | Role |
 | --- | --- | --- |
-| Dashboard | http://localhost:8501 | Operator UI for health, drift, queue, registry, and HIL approvals |
-| Platform | http://localhost:8000 | Prediction API, drift report, queue status, registry status, promotion gate |
-| Agent | http://localhost:8001 | Drift webhook receiver, LangGraph triage, HIL routes, Redis dispatch |
-| MLflow | http://localhost:5000 | Tracking server and model registry |
-| Redis | localhost:6379 | Queue and DLQ for slow jobs |
-| Postgres | localhost:55432 | HIL approvals, investigations, promotion audit |
+| Dashboard | `http://localhost:8501` | Operator UI |
+| Platform | `http://localhost:8000` | Predictions, drift, registry, queue status |
+| Agent | `http://localhost:8001` | Webhook receiver, deterministic triage, HIL routes |
+| MLflow | `http://localhost:5000` | Tracking and registry |
+| Redis | `localhost:6379` | Queue and DLQ |
+| Postgres | `localhost:55432` | HIL approvals, audit, investigations, checkpoints, drift state |
+| pgAdmin | `http://localhost:5050` | Postgres browser |
 
 ## Startup
 
-From the repo root:
-
 ```powershell
-cp .env.example .env
+Copy-Item .env.example .env
 docker compose up -d --build
 docker compose ps
 ```
@@ -35,81 +34,59 @@ Expected result:
 
 ## Main Mental Model
 
-There are two different dashboard flows:
+There is one dashboard flow now:
 
-1. Real Drift Monitoring
-2. Demo Agent Alerts
+1. send real prediction traffic to the platform
+2. run a real drift report
+3. let platform notify agent when severity changes
+4. let agent queue safe work
+5. let worker finish the slow job
+6. review or approve the resulting HIL item when Production could change
 
-They are separate on purpose.
-
-## Flow 1: Real Drift Monitoring
-
-This is the real platform path:
+## End-To-End Critical Drift Flow
 
 ```text
 Dashboard -> Platform /predict/
 Dashboard -> Platform /drift/report
-Platform -> Agent /webhook/drift only if drift severity changes
+Platform -> Agent /webhook/drift
+Agent -> Redis queue
+Worker -> retrain + MLflow candidate registration
+Worker -> Agent /hil/notify-candidate
+Dashboard -> Agent /hil/pending
+Dashboard -> Agent /hil/{id}/approve
+Agent -> Platform /registry/promote
+Platform -> Postgres audit write -> MLflow alias change -> model reload
 ```
 
-The dashboard button `Generate 60 Sample Predictions` sends 60 real requests to:
+## Dashboard Buttons
 
-```text
-POST http://localhost:8000/predict/
-```
+The current dashboard uses:
 
-Those predictions fill the platform rolling drift window. The button does not fake drift by itself; it creates real prediction history.
+- `Normal (500)`
+- `Moderate Drift`
+- `Critical Drift`
 
-Then `Run Real Drift Report` calls:
+These buttons send real prediction traffic and then call `/drift/report`.
 
-```text
-GET http://localhost:8000/drift/report
-```
+There is no separate synthetic "demo alert" button path in the dashboard anymore.
 
-The platform computes PSI, categorical drift, and output drift from accumulated prediction history.
+## Severity Behavior
 
-Webhook status meanings:
-
-| Status | Meaning |
-| --- | --- |
-| `waiting_for_data` | Platform does not have enough prediction history yet |
-| `suppressed` | Drift report ran, but severity did not change, so no webhook was emitted |
-| `sent` | Platform emitted a webhook to the agent |
-| `failed` | Platform tried to send a webhook but the agent call failed |
-
-Important: `suppressed` is not a failure. It means the platform did the correct thing and avoided sending duplicate alerts.
-
-## Flow 2: Demo Agent Alerts
-
-This is the synthetic demo path:
-
-```text
-Dashboard -> Agent /webhook/drift
-```
-
-The buttons `Send Stable Demo Alert`, `Send Moderate Demo Alert`, and `Send Critical Demo Alert (queues retrain)` bypass platform drift history and send a valid `DriftAlert` payload directly to the agent.
-
-This path exists so the presentation can quickly show agent routing without waiting for natural drift changes.
-
-Agent action policy:
-
-| Severity | Agent Action | Approval Required? | Why |
+| Severity | Agent Action | Queue? | Approval immediately? |
 | --- | --- | --- | --- |
-| `stable` | `none` | No | Nothing needs to happen |
-| `moderate` | `replay_test` | No | Replay is a safe queued check |
-| `critical` | `retrain` | No | Retrain creates a candidate model only |
-| rollback | `rollback` | Yes | Rollback would affect Production |
-| promotion | `promote_candidate` | Yes | Promotion would affect Production |
+| `stable` | `none` | No | No |
+| `moderate` | `replay_test` | Yes | No |
+| `critical` | `retrain` | Yes | Not immediately |
 
-Critical drift does not ask for approval because retraining does not change Production. It only creates a new candidate model in MLflow.
+Important:
+
+- critical drift does not create an approval instantly
+- retraining must finish first
+- after retraining, the worker creates a `promote_candidate` HIL approval through the agent
+
+That is why the dashboard tells the operator to wait a few seconds and refresh the HIL inbox.
 
 ## Queue And Worker Flow
-
-Safe slow actions are queued in Redis:
-
-```text
-Agent -> Redis queue drift-triage-jobs -> Worker -> MLflow/platform action
-```
 
 Queue names:
 
@@ -120,12 +97,12 @@ DLQ:   DLQ:drift-triage-jobs
 
 Expected behavior:
 
-- Moderate demo alert queues `replay_test`.
-- Worker consumes `replay_test` and logs `replay_complete`.
-- Critical demo alert queues `retrain`.
-- Worker consumes `retrain`, runs training, and registers a new candidate in MLflow.
-- Queue length may return to `0` quickly because the worker consumed the job.
-- DLQ can contain rollback safety jobs. In this demo, rollback is intentionally not implemented as an automatic Production mutation.
+- moderate drift queues `replay_test`
+- critical drift queues `retrain`
+- worker retraining registers a candidate version in MLflow
+- worker resolves the concrete candidate version
+- worker calls `POST /hil/notify-candidate`
+- a pending `promote_candidate` approval appears in the inbox
 
 Useful checks:
 
@@ -137,9 +114,7 @@ docker compose logs --tail=120 worker
 
 ## HIL Approval Flow
 
-HIL means human-in-the-loop approval. It is only for Production-changing actions.
-
-The dashboard HIL Inbox reads:
+The HIL inbox reads:
 
 ```text
 GET http://localhost:8001/hil/pending
@@ -152,77 +127,66 @@ POST http://localhost:8001/hil/{approval_id}/approve
 POST http://localhost:8001/hil/{approval_id}/reject
 ```
 
-Critical demo alert will not create a pending approval because it queues retraining only. Retraining creates a candidate model, not a Production change.
+Approval behavior:
 
-The actions that require HIL are:
+- approving `promote_candidate` dispatches `POST /registry/promote`
+- approving `rollback` dispatches `POST /registry/rollback`
+- approvals are persisted in Postgres
+- repeated event delivery reuses the same investigation by `drift_event_id`
 
-- rollback
-- promote candidate to Production
-
-## Registry And MLflow Flow
+## Registry Flow
 
 The dashboard registry panel reads:
 
 ```text
 GET http://localhost:8000/registry/status
+GET http://localhost:8000/registry/history
 ```
 
-Expected demo state:
+Expected status fields:
 
-- Registered model: `bank_marketing_pipeline`
-- Candidate version: present after retrain
-- Production version: may be empty/null
+- `registered_model_name`
+- `production_version`
+- `candidate_version`
+- `previous_production_version`
+- `production_metrics`
 
-This is safe. Retraining creates candidate versions only. Production is not changed automatically.
+Expected history behavior:
 
-Open MLflow:
-
-```text
-http://localhost:5000
-```
-
-Look for:
-
-- model name: `bank_marketing_pipeline`
-- experiment/run from training or retraining
-- candidate model versions
-
-Ignore MLflow GenAI demo/sample models if they appear.
+- every promotion and rollback is written to `promotion_audit`
+- rollback uses the previously audited Production version as the operator-visible target
 
 ## Presentation Script
 
-1. Open dashboard: http://localhost:8501
+1. Open dashboard: `http://localhost:8501`
 2. Show service health cards.
-3. Explain the dashboard has two paths:
-   - Real Drift Monitoring uses platform `/predict/` history.
-   - Demo Agent Alerts sends synthetic alerts directly to the agent.
-4. Click `Generate 60 Sample Predictions`.
-5. Show `Prediction Window Readiness`.
-6. Click `Run Real Drift Report`.
-7. If the status is `suppressed`, explain: the platform ran drift detection, but severity did not change, so it correctly suppressed a duplicate webhook.
-8. Click `Send Moderate Demo Alert`.
-9. Show action `replay_test`, status `queued`, and queue `drift-triage-jobs`.
-10. Show worker logs or queue panel. Queue length `0` can mean the worker consumed the job.
-11. Click `Send Critical Demo Alert (queues retrain)`.
-12. Show action `retrain`, status `queued`, and approval required `False`.
-13. Explain: critical retrain creates a candidate only, so no HIL approval is needed.
-14. Open registry panel or MLflow and show the candidate model version.
-15. Show HIL Inbox.
-16. Explain: HIL approval appears only for rollback or promotion because those can change Production.
-17. If a pending approval exists, approve/reject it from the dashboard.
+3. Click `Moderate Drift` and explain that the agent queues `replay_test`.
+4. Click `Critical Drift` and explain that the worker retrains before any approval appears.
+5. Wait a few seconds, then click `Refresh` in the HIL inbox.
+6. Show the pending `promote_candidate` approval.
+7. Approve it.
+8. Show `registry/status` with current Production version and metrics.
+9. Open promotion history and explain rollback gating.
+10. If needed, open pgAdmin or query Postgres to prove audit rows.
 
-## What To Say If Asked Why Critical Does Not Ask For Approval
+## What To Say If Asked Why Critical Does Not Ask For Approval Immediately
 
-Use this exact explanation:
+Use this explanation:
 
 ```text
-Critical drift means the agent should respond urgently, but it does not mean it can mutate Production.
-Our deterministic policy maps critical drift to retrain, and retrain creates a candidate model only.
-Production-changing actions are rollback and promotion, and those require HIL approval.
+Critical drift triggers retraining, not an automatic Production change.
+Retraining only creates a candidate model version.
+Approval is required when we are about to promote that candidate or roll Production back.
+That is why the approval appears after the worker finishes retraining, not at the moment drift is detected.
 ```
 
-## Current Known Caveat
+## Recovery And Persistence
 
-LangGraph StateGraph is implemented and tested. Postgres HIL persistence is implemented. LangGraph Postgres checkpoint integration is prepared, but full checkpoint resume is not the main proven recovery path yet.
+The repo now proves durable Postgres-backed persistence for:
 
-Do not claim full checkpoint resume unless it is tested live.
+- HIL approvals
+- investigations
+- investigation checkpoints
+- platform drift state
+
+The optional LangGraph Postgres checkpoint helper still exists, but the live recovery path in this project is the repo-owned Postgres persistence flow.

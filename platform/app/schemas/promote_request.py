@@ -7,5 +7,6 @@ from pydantic import BaseModel
 class PromoteRequest(BaseModel):
     model_uri: str
     approved_by: str
+    approval_id: str
     investigation_id: str
     timestamp: datetime

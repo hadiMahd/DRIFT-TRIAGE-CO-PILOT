@@ -194,6 +194,12 @@ async def get_report(
             success, error, webhook_response = await emit_webhook(report, client, settings)
             if success:
                 app_state.last_severity = severity
+                store = getattr(app_state, "drift_state_store", None)
+                if store is not None:
+                    try:
+                        await store.save_state(accumulator, app_state.last_severity)
+                    except Exception:
+                        pass
         else:
             success = False
             error = "severity unchanged — webhook suppressed"

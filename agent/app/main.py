@@ -2,12 +2,31 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from agent.app.routers import hil, webhook
+from agent.app.services import investigations, request_approval
 
 
-app = FastAPI(title="Drift Triage Co-Pilot Agent", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await investigations.ensure_tables()
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        for close_pool in (request_approval.close_pool, investigations.close_pool):
+            try:
+                await close_pool()
+            except Exception:
+                pass
+
+
+app = FastAPI(title="Drift Triage Co-Pilot Agent", version="0.1.0", lifespan=lifespan)
 app.include_router(webhook.router)
 app.include_router(hil.router)
 

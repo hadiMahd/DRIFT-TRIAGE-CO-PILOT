@@ -1,100 +1,89 @@
 # Decisions
 
-## Platform Decisions (Hadi)
+## Platform Decisions
 
 ### Model Selection: HistGradientBoostingClassifier
 
-Three models were compared via stratified cross-validation and HistGradientBoostingClassifier was chosen because it performed best overall while staying fast and sklearn-native.
+The serving model remains `HistGradientBoostingClassifier` because it performed best in the repo's training pipeline while staying sklearn-native and simple to ship in Docker.
 
 ### Threshold Rule: Highest Threshold Where Recall >= 0.75
 
-The operating threshold follows the Week 5 requirement:
+The threshold-selection logic is unchanged:
 
 `precision_recall_curve(y_true, y_proba) -> highest threshold with recall >= 0.75`
 
-That threshold is frozen after validation and then applied to test and serving.
-
-### Artifact Hashing: SHA256
-
-Model artifacts are hashed with SHA256 and the hash is carried through the model card and validation checks.
+The numeric threshold may change after retraining, but the rule does not.
 
 ### Candidate Alias Pattern
 
-Training registers a candidate model version only. Production is never set automatically during training.
+Training only registers a candidate model version. Retraining does not move the `Production` alias.
 
-### Feature Preprocessing
+### Registry Safety
 
-- drop `duration`
-- preserve `unknown` as a real category
-- turn `pdays == 999` into a sentinel feature
-- keep preprocessing inside the sklearn pipeline
+- `GET /registry/status` exposes registered model name, production version, candidate version, previous production version, and production metrics when available.
+- `GET /registry/history` returns promotion and rollback audit history from Postgres.
+- `POST /registry/promote` requires `approval_id` and validates an approved `promote_candidate` HIL row before changing MLflow aliases.
+- `POST /registry/rollback` requires `approval_id` and validates an approved rollback HIL row before changing MLflow aliases.
 
-### Worker Idempotency
+### Audit-First Mutation
 
-Worker-side idempotency follows:
+Promotion and rollback write durable Postgres audit rows before mutating the MLflow `Production` alias. If the audit write fails, the alias change is aborted.
 
-`idempotency:{action}:{investigation_id}:{target}`
+### Drift-State Persistence
 
-### Promotion Audit
+Platform drift history is persisted in Postgres so prediction-window state and last severity survive service restarts.
 
-Successful promotions write an audit row to Postgres.
+## Agent Decisions
 
-### Rollback Safety
+### Deterministic Routing And Action Policy
 
-Rollback requires `approval_id` and remains intentionally non-automatic. Current worker behavior DLQs rollback jobs rather than mutating Production directly.
+The supervisor topology is deterministic:
 
-## Agent Decisions (Jad)
+`START -> supervisor -> triage -> supervisor -> action -> supervisor -> execute_action -> supervisor -> comms -> END`
 
-### Deterministic Safety Baseline
+Severity-to-action mapping is also deterministic:
 
-Deterministic action rules remain the source of truth even when LLM support is enabled:
+- `stable -> none`
+- `moderate -> replay_test`
+- `critical -> retrain`
 
-- stable -> `none`
-- moderate -> `replay_test`
-- critical -> `retrain`
+LLM output can improve summaries, but it does not control routing or Production-changing decisions.
 
-The agent does not let model output bypass these rules.
+### HIL As The Production Boundary
 
-### Optional LLM Mode
+The agent never mutates Production directly during webhook handling.
 
-`LLM_PROVIDER=mock` is the default and requires no API keys.
+- Safe actions are queued immediately: `replay_test`, `retrain`
+- Production-changing actions are gated: `promote_candidate`, `rollback`
 
-`LLM_PROVIDER=azure` enables Azure-hosted Kimi usage through environment variables:
+Approving a HIL action dispatches the corresponding platform call from the agent:
 
-- `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_API_VERSION`
-- `AZURE_OPENAI_DEPLOYMENT` or `AZURE_STRONG_MODEL`
+- approve promotion -> `POST /registry/promote`
+- approve rollback -> `POST /registry/rollback`
 
-The strong-model default is:
+### Durable Investigation State
 
-`AZURE_STRONG_MODEL=Kimi-K2.6-1`
+The agent persists:
 
-LLM output may improve summaries or rationale, but it cannot directly execute a production-changing action.
+- `investigations`
+- `investigation_checkpoints`
+- `hil_approvals`
 
-### LangGraph Wrapper
+Investigation state is reused by `drift_event_id`, so repeated delivery of the same drift event resumes the same investigation instead of creating a new one.
 
-The agent now runs through a LangGraph `StateGraph` wrapper:
+### Postgres-Backed Checkpointing
 
-`triage -> action -> execute_action -> comms`
+The live recovery path is Postgres-backed persistence owned by the repo:
 
-This preserves the existing deterministic flow while giving the project a real graph wrapper for later expansion.
+- investigation rows
+- checkpoint rows
+- HIL approval rows
 
-### Safe Action Policy
+The optional LangGraph Postgres checkpoint helper still exists, but the proven recovery path in this project is the repo's own persisted state flow.
 
-Safe actions are queued:
+## Worker Decisions
 
-- `replay_test`
-- `retrain`
-
-Production-impacting actions are gated:
-
-- `rollback` requires HIL approval
-- `promote_candidate` requires HIL approval
-
-The agent never promotes or rolls back Production directly.
-
-### Redis Queue Contract
+### Queue Contract
 
 Shared queue contract:
 
@@ -102,55 +91,52 @@ Shared queue contract:
 - DLQ: `DLQ:drift-triage-jobs`
 - idempotency format: `idempotency:{action}:{investigation_id}:{target_or_event}`
 
-The dashboard only displays queue state; it does not own queue logic.
+### Candidate Notification Reliability
 
-### Postgres Persistence
+After retraining, the worker resolves the concrete candidate version and notifies the agent through `/hil/notify-candidate`.
 
-The agent persists HIL approvals and related state in Postgres. This persistence is the current recovery-critical storage.
+That notification now uses retries and a longer timeout so retrain completion does not silently lose the HIL approval step.
 
-### LangGraph Checkpoint Status
+### Rollback Handling
 
-Current implementation persists HIL approvals and approval state in Postgres. LangGraph checkpoint integration is prepared but not used as the main recovery mechanism yet.
+The worker rollback handler is implemented and sends:
 
-### Stable Drift Cost Control
+- `target_model_version`
+- `approval_id`
+- `approved_by`
 
-Stable drift does not require an expensive LLM decision to preserve responsiveness and keep the demo usable without external model calls.
+Missing `approval_id` is rejected safely.
 
-## Infrastructure Decisions (Shared)
+## Infrastructure Decisions
 
 ### Docker Service-Name Networking
 
-Inside Compose, services communicate by service name instead of `localhost`.
+Inside Compose, services communicate by service name, not `localhost`.
 
-### Default Demo Mode
+### Demo Defaults
 
-The clean no-key demo path uses:
+The no-key path uses:
 
 - `LLM_PROVIDER=mock`
-- Docker Compose service discovery
-- Redis + Postgres + MLflow local containers
+- local Compose networking
+- Redis, Postgres, MLflow, and pgAdmin containers
 
 ### Dashboard Role
 
-The dashboard is a control room and operator UI. It displays service health, queue state, registry state, and HIL approvals, but it does not become the source of business logic.
+The dashboard is an operator console. It shows health, drift results, queue status, registry status, HIL approvals, and rollback controls, but it is not the source of business logic.
 
 ### Postgres Scope
 
 Postgres stores:
 
 - `hil_approvals`
+- `investigations`
+- `investigation_checkpoints`
+- `platform_drift_state`
 - `promotion_audit`
-
-It is not yet the primary LangGraph checkpoint store in production practice, even though the helper exists.
-
-### Safety Boundary
-
-Human approval remains the boundary for any action that could change Production.
 
 ## Open Questions
 
-- Webhook vs polling: webhook remains the primary drift handoff mechanism for now.
-- LLM choice: Azure-hosted Kimi is supported, but mock mode remains the default demo-safe setting.
-- Queue idempotency strategy: Redis idempotency key plus worker retry/DLQ behavior.
-- HIL stale-approval handling: expiry and escalation rules are still to be formalized.
-- Checkpoint store sync with registry: future work once LangGraph checkpoint resume becomes a first-class recovery path.
+- Whether to adopt the official LangGraph Postgres checkpoint backend instead of the current repo-owned persistence approach
+- Whether to formalize expiry/escalation rules for long-lived pending HIL approvals
+- Whether to automate a richer rollback-job initiation flow instead of relying on explicit approval-driven operator actions

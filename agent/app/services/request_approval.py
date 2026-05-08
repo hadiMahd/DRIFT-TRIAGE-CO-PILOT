@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from typing import Any, Literal, Mapping
 from uuid import uuid4
@@ -11,6 +12,8 @@ from agent.app.schemas.investigation import RecommendedAction
 
 
 ApprovalTransition = Literal["approved", "rejected"]
+_pool: Any | None = None
+_pool_lock: asyncio.Lock | None = None
 
 
 def _get_postgres_dsn() -> str:
@@ -49,6 +52,39 @@ async def _connect() -> Any:
 
     asyncpg = _load_asyncpg()
     return await asyncpg.connect(_get_postgres_dsn())
+
+
+def _get_pool_lock() -> asyncio.Lock:
+    global _pool_lock
+    if _pool_lock is None:
+        _pool_lock = asyncio.Lock()
+    return _pool_lock
+
+
+async def _get_pool() -> Any:
+    global _pool
+
+    if _pool is not None:
+        return _pool
+
+    async with _get_pool_lock():
+        if _pool is None:
+            asyncpg = _load_asyncpg()
+            _pool = await asyncpg.create_pool(
+                dsn=_get_postgres_dsn(),
+                min_size=1,
+                max_size=10,
+                command_timeout=30,
+            )
+    return _pool
+
+
+async def close_pool() -> None:
+    global _pool
+
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
 
 
 def row_to_hil_action(row: Mapping[str, Any] | None) -> HILAction | None:
@@ -104,8 +140,8 @@ async def create_pending_approval(
         drift_event_id=drift_event_id,
         target_model_version=target_model_version,
     )
-    connection = await _connect()
-    try:
+    pool = await _get_pool()
+    async with pool.acquire() as connection:
         row = await connection.fetchrow(
             """
             INSERT INTO hil_approvals (
@@ -127,23 +163,19 @@ async def create_pending_approval(
             requested_by,
             stable_key,
         )
-        approval = row_to_hil_action(row)
-        if approval is None:
-            raise RuntimeError("Failed to create or fetch pending approval.")
-        return approval
-    finally:
-        await connection.close()
+    approval = row_to_hil_action(row)
+    if approval is None:
+        raise RuntimeError("Failed to create or fetch pending approval.")
+    return approval
 
 
 async def get_approval(approval_id: str) -> HILAction | None:
     """Fetch an approval by id."""
 
-    connection = await _connect()
-    try:
+    pool = await _get_pool()
+    async with pool.acquire() as connection:
         row = await _fetch_approval_row(connection, approval_id)
-        return row_to_hil_action(row)
-    finally:
-        await connection.close()
+    return row_to_hil_action(row)
 
 
 async def _transition_approval(
@@ -154,8 +186,8 @@ async def _transition_approval(
 ) -> HILAction:
     """Apply an approval status transition with validation."""
 
-    connection = await _connect()
-    try:
+    pool = await _get_pool()
+    async with pool.acquire() as connection:
         current_row = await _fetch_approval_row(connection, approval_id)
         if current_row is None:
             raise ValueError(f"Approval '{approval_id}' was not found.")
@@ -189,8 +221,6 @@ async def _transition_approval(
         if approval is None:
             raise RuntimeError(f"Approval '{approval_id}' could not be updated.")
         return approval
-    finally:
-        await connection.close()
 
 
 async def approve_action(
@@ -226,8 +256,8 @@ async def reject_action(
 async def list_pending_approvals(limit: int = 50) -> list[HILAction]:
     """List the newest pending approvals."""
 
-    connection = await _connect()
-    try:
+    pool = await _get_pool()
+    async with pool.acquire() as connection:
         rows = await connection.fetch(
             """
             SELECT approval_id, investigation_id, drift_event_id, requested_action,
@@ -240,6 +270,4 @@ async def list_pending_approvals(limit: int = 50) -> list[HILAction]:
             """,
             limit,
         )
-        return [approval for row in rows if (approval := row_to_hil_action(row)) is not None]
-    finally:
-        await connection.close()
+    return [approval for row in rows if (approval := row_to_hil_action(row)) is not None]
