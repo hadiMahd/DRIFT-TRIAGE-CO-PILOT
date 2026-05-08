@@ -169,7 +169,6 @@ def test_promote_requires_approved_by(test_client):
     payload = {
         "model_uri": "models:/bank_marketing_pipeline@candidate",
         "approved_by": "",
-        "approval_id": "apr-1",
         "investigation_id": "test-inv-1",
         "timestamp": "2026-05-06T12:00:00Z",
     }
